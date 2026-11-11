@@ -191,9 +191,9 @@ function makeTimeField(cell, field, _gridRow) {
   return { originId: id, override: null };
 }
 
-/* ---------- 编辑区渲染 ---------- */
+/* ---------- 编辑区渲染（仅在建表/切换表/改映射时全量渲染一次） ---------- */
 
-function renderEditor(focus) {
+function renderEditor() {
   const head = `
     <thead><tr>
       <th style="width:46px">#</th><th>路段</th><th>方向</th>
@@ -205,7 +205,7 @@ function renderEditor(focus) {
     const endErr = fieldError(row, "end");
     const orderErr = orderError(row);
     const rowClass = startErr || endErr || orderErr ? ' class="row-error"' : "";
-    return `<tr${rowClass}>
+    return `<tr data-row="${i}"${rowClass}>
       <td>${i + 1}</td>
       <td><input class="road-input" data-field="road" data-row="${i}"
                  value="${escapeHtml(row.road)}" placeholder="路段"></td>
@@ -218,15 +218,6 @@ function renderEditor(focus) {
 
   $("#editor-table").innerHTML = head + `<tbody>${body}</tbody>`;
   renderValidationSummary();
-
-  if (focus) {
-    const input = document.querySelector(
-      `input.time-input[data-row="${focus.row}"][data-timefield="${focus.field}"]`);
-    if (input) {
-      input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
-    }
-  }
 }
 
 function timeCellHtml(row, rowIndex, field, errorMsg) {
@@ -241,11 +232,12 @@ function timeCellHtml(row, rowIndex, field, errorMsg) {
          data-row="${rowIndex}" data-timefield="${field}">撤销覆盖（取原格最新值）</button>`
     : `<button type="button" class="btn btn-mini" data-action="override"
          data-row="${rowIndex}" data-timefield="${field}">单独覆盖此行</button>`;
+  const groupSize = origin.rowIndexes.length;
   const badge = isOverride ? ""
-    : `<span class="shared-badge">原格共用 ${origin.rowIndexes.length} 行</span>`;
+    : `<span class="shared-badge">原格共用 ${groupSize} 行</span>`;
   const note = isOverride
     ? `<div class="origin-note">覆盖中；原格当前值：${escapeHtml(origin.text) || "（空）"}</div>`
-    : `<div class="origin-note">编辑此框将更新原格共用时间，仅作用于未覆盖的 ${origin.rowIndexes.length} 行</div>`;
+    : `<div class="origin-note">编辑此框将更新原格共用时间，仅作用于该原格 ${groupSize} 行中未覆盖的行</div>`;
   const errHtml = errorMsg ? `<div class="field-err">${escapeHtml(errorMsg)}</div>` : "";
 
   return `
@@ -279,6 +271,8 @@ function collectErrors() {
 function renderValidationSummary() {
   const errors = collectErrors();
   const list = $("#error-list");
+  const exportBtn = $("#export-btn");
+  if (exportBtn) exportBtn.disabled = errors.length > 0;
   if (errors.length) {
     $("#validate-status").textContent =
       `共 ${state.rows.length} 行，其中 ${errors.length} 行存在错误，导出已被阻止。`;
@@ -292,6 +286,75 @@ function renderValidationSummary() {
     list.hidden = true;
     list.innerHTML = "";
   }
+}
+
+/* ---------- 定向刷新（不整表重绘、不动光标） ---------- */
+
+function rowEl(rowIndex) {
+  return document.querySelector(`#editor-table tr[data-row="${rowIndex}"]`);
+}
+
+function timeInput(rowIndex, field) {
+  const tr = rowEl(rowIndex);
+  return tr ? tr.querySelector(`input.time-input[data-timefield="${field}"]`) : null;
+}
+
+function timeCell(rowIndex, field) {
+  const input = timeInput(rowIndex, field);
+  return input ? input.closest("td") : null;
+}
+
+// 重画一个时间格的内部 DOM（仅用于“覆盖/撤销”按钮：输入框本身会被替换，
+// 调用方随后把焦点与光标恢复到新输入框末尾）。
+function rebuildTimeCell(rowIndex, field) {
+  const cell = timeCell(rowIndex, field);
+  if (!cell) return;
+  const row = state.rows[rowIndex];
+  cell.innerHTML = timeCellHtml(row, rowIndex, field, fieldError(row, field) ||
+    (field === "end" ? orderError(row) : ""));
+}
+
+// 重验单行：更新两个时间输入框的 invalid 状态、行内错误文字与行红底，不重建 input。
+function refreshRowValidation(rowIndex) {
+  const row = state.rows[rowIndex];
+  if (!row) return;
+  const tr = rowEl(rowIndex);
+  if (!tr) return;
+
+  for (const field of ["start", "end"]) {
+    const input = timeInput(rowIndex, field);
+    if (input) input.classList.toggle("invalid", parseDateTime(input.value) === null);
+    const cell = timeCell(rowIndex, field);
+    if (cell) {
+      const err = fieldError(row, field) || (field === "end" ? orderError(row) : "");
+      let errEl = cell.querySelector(".field-err");
+      if (err) {
+        if (!errEl) {
+          errEl = document.createElement("div");
+          errEl.className = "field-err";
+          cell.append(errEl);
+        }
+        errEl.textContent = err;
+      } else if (errEl) {
+        errEl.remove();
+      }
+    }
+  }
+
+  tr.classList.toggle("row-error",
+    !!(fieldError(row, "start") || fieldError(row, "end") || orderError(row)));
+}
+
+// 已覆盖行不参与原格重验，但其“原格当前值”提示需随原格最新文本更新。
+function updateOriginNotes(originId, field, text) {
+  document.querySelectorAll(
+    `input.time-input[data-timefield="${field}"]`).forEach((input) => {
+    const i = Number(input.dataset.row);
+    const f = state.rows[i]?.[field];
+    if (!f || f.originId !== originId || f.override === null) return;
+    const note = input.closest("td")?.querySelector(".origin-note");
+    if (note) note.textContent = `覆盖中；原格当前值：${text || "（空）"}`;
+  });
 }
 
 /* ---------- 编辑事件 ---------- */
@@ -311,18 +374,28 @@ $("#editor-table").addEventListener("input", (ev) => {
   const row = state.rows[rowIndex];
 
   if (row[field].override !== null) {
-    // 单行覆盖：只改本行
+    // 单行覆盖：只改本行数据，只重验本行；input 原地不动，光标不跳。
     row[field].override = target.value;
-    renderValidationSummary();
     target.classList.toggle("invalid", parseDateTime(target.value) === null);
-    const tr = target.closest("tr");
-    tr.classList.toggle("row-error",
-      !!(fieldError(row, "start") || fieldError(row, "end") || orderError(row)));
-  } else {
-    // 原格共用时间：更新原格，仅影响未覆盖的共用行
-    state.origins[field][row[field].originId].text = target.value;
-    renderEditor({ row: rowIndex, field });
+    refreshRowValidation(rowIndex);
+    renderValidationSummary();
+    return;
   }
+
+  // 原格共用时间：更新原格文本，只重验仍取该原格（未覆盖）的共用行，
+  // 不触碰其他原格/其他行，更不重建正在输入的 input。
+  const originId = row[field].originId;
+  state.origins[field][originId].text = target.value;
+
+  for (const i of state.origins[field][originId].rowIndexes) {
+    const f = state.rows[i][field];
+    if (f.override !== null) continue;
+    const input = timeInput(i, field);
+    if (input && input !== target) input.value = target.value;
+    refreshRowValidation(i);
+  }
+  updateOriginNotes(originId, field, target.value);
+  renderValidationSummary();
 });
 
 $("#editor-table").addEventListener("click", (ev) => {
@@ -331,14 +404,30 @@ $("#editor-table").addEventListener("click", (ev) => {
   const rowIndex = Number(btn.dataset.row);
   const field = btn.dataset.timefield;
   const row = state.rows[rowIndex];
+  if (!row || (field !== "start" && field !== "end")) return;
 
   if (btn.dataset.action === "override") {
+    // 单独覆盖此行：私有值初始化为当前生效值，只重画本行本格、只重验本行。
     row[field].override = effectiveValue(row, field);
-    renderEditor({ row: rowIndex, field });
+    rebuildTimeCell(rowIndex, field);
+    refreshRowValidation(rowIndex);
+    renderValidationSummary();
+    const input = timeInput(rowIndex, field);
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
   } else if (btn.dataset.action === "revert") {
-    // 撤销覆盖：重新取对应原格的最新值
+    // 撤销覆盖：本行重新取对应原格的最新值，只重画本行本格、只重验本行。
     row[field].override = null;
-    renderEditor({ row: rowIndex, field });
+    rebuildTimeCell(rowIndex, field);
+    refreshRowValidation(rowIndex);
+    renderValidationSummary();
+    const input = timeInput(rowIndex, field);
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
   }
 });
 
